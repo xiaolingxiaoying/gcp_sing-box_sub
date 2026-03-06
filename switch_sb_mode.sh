@@ -1,76 +1,79 @@
 #!/bin/bash
 
-# Configuration paths
+# 配置文件路径
 SB_CONFIG="/etc/s-box/sb.json"
 BACKUP_CONFIG="/etc/s-box/sb.json.bak"
-SERVICE_NAME="sing-box" # Verify your service name, sometimes it might be 'sing-box.service'
+SERVICE_NAME="sing-box" # 请确认你的服务名称，有时可能是 'sing-box.service'
 
-# Check for root
+# 检查 root 权限
 if [ "$EUID" -ne 0 ]; then 
-  echo "Please run as root"
+  echo "请使用 root 权限运行此脚本"
   exit 1
 fi
 
-# Check and install jq if missing
+# 检查并安装 jq
 if ! command -v jq &> /dev/null; then
-    echo "jq is required but not installed. Installing..."
+    echo "未检测到 jq，正在安装..."
     if [ -f /etc/debian_version ]; then
         apt-get update && apt-get install -y jq
     elif [ -f /etc/redhat-release ]; then
-        yum install -y epel-release
+        if ! rpm -qa | grep -q epel-release; then
+            yum install -y epel-release
+        fi
         yum install -y jq
     else
-        echo "OS not supported for auto-install. Please install 'jq' manually."
+        echo "不支持自动安装。请手动安装 'jq' 后重试。"
         exit 1
     fi
 fi
 
 echo "==========================================="
-echo " Sing-box Outbound Strategy Switcher"
+echo " Sing-box 出站策略切换脚本"
 echo "==========================================="
-echo "1. Mode: Native IPv4 (Use physical network card)"
-echo "   - Removes preference for IPv6"
-echo "   - Removes forced IPv6 via WARP"
+echo "1. 模式一：原生 IPv4 (使用物理网卡出站)"
+echo "   - 移除 IPv6 优先策略"
+echo "   - 移除 WARP 强制 IPv6 规则"
 echo ""
-echo "2. Mode: IPv6 Preferred (Use WARP IPv6 if available)"
-echo "   - Adds preference for IPv6 resolution"
-echo "   - Routes all IPv6 traffic via WARP"
+echo "2. 模式二：IPv6 优先 (WARP IPv6 可用时优先使用)"
+echo "   - 增加 IPv6 解析优先策略"
+echo "   - 强制所有 IPv6 流量走 WARP"
 echo "==========================================="
-read -p "Enter your choice [1 or 2]: " choice
+read -p "请输入你的选择 [1 或 2]: " choice
 
-# Function to backup config
+# 备份配置函数
 backup_config() {
-    echo "Backing up configuration to $BACKUP_CONFIG..."
+    echo "正在备份配置到 $BACKUP_CONFIG..."
     cp "$SB_CONFIG" "$BACKUP_CONFIG"
 }
 
 case "$choice" in
     1)
-        echo "Switching to Native IPv4 Mode..."
+        echo "正在切换至 [模式一：原生 IPv4]..."
         backup_config
         
-        # Logic: Delete the specific IPv6 rules
-        # 1. Delete global prefer_ipv6 strategy (checking domain_suffix is null to avoid deleting specific domain rules)
-        # 2. Delete the specific warp-out rule for ::/0
+        # 逻辑：删除特定的 IPv6 规则
+        # 1. 删除全局 prefer_ipv6 策略（检查 domain_suffix 为空以避免删除特定域名的规则）
+        # 2. 删除特定的 warp-out 规则（检查 ip_cidr 不为空以避免 jq 报错）
         tmp=$(mktemp)
         jq 'del(.route.rules[] | select(.strategy == "prefer_ipv6" and .domain_suffix == null)) | 
-            del(.route.rules[] | select(.outbound == "warp-out" and (.ip_cidr | contains(["::/0"]))))' \
+            del(.route.rules[] | select(.outbound == "warp-out" and (.ip_cidr != null) and (.ip_cidr | contains(["::/0"]))))' \
             "$SB_CONFIG" > "$tmp" && mv "$tmp" "$SB_CONFIG"
         
-        echo "Modifications applied."
+        echo "配置修改已应用。"
         ;;
     2)
-        echo "Switching to IPv6 Preferred Mode..."
+        echo "正在切换至 [模式二：IPv6 优先]..."
         backup_config
         
         tmp=$(mktemp)
-        # Step 1: Clean up existing rules to avoid duplicates (same as Mode 1)
+        # 第一步：清理现有规则以避免重复（同模式一）
+        # 增加了 ip_cidr != null 检查
         jq 'del(.route.rules[] | select(.strategy == "prefer_ipv6" and .domain_suffix == null)) | 
-            del(.route.rules[] | select(.outbound == "warp-out" and (.ip_cidr | contains(["::/0"]))))' \
+            del(.route.rules[] | select(.outbound == "warp-out" and (.ip_cidr != null) and (.ip_cidr | contains(["::/0"]))))' \
             "$SB_CONFIG" > "$tmp"
             
-        # Step 2: Insert new rules after the first rule (assuming index 0 is "sniff" or similar base rule)
-        # We inject: 1. Global IPv6 preference 2. Route ::/0 to warp-out
+        # 第二步：在第一条规则之后插入新规则（假设索引 0 是 sniff 或类似的基础规则）
+        # 我们插入：1. 全局 IPv6 优先策略 2. 路由 ::/0 到 warp-out
         jq '.route.rules |= [.[0]] + [
             {
                 "action": "resolve",
@@ -83,21 +86,23 @@ case "$choice" in
         ] + .[1:]' "$tmp" > "$SB_CONFIG"
         rm -f "$tmp"
         
-        echo "Modifications applied."
+        echo "配置修改已应用。"
         ;;
     *)
-        echo "Invalid choice. Exiting."
+        echo "无效的选择。退出。"
         exit 1
         ;;
 esac
 
-# Restart Service
-echo "Restarting $SERVICE_NAME..."
+# 重启服务
+echo "正在重启 $SERVICE_NAME..."
 if systemctl restart "$SERVICE_NAME"; then
-    echo "Success! Service restarted."
+    echo "成功！服务已重启。"
     systemctl status "$SERVICE_NAME" --no-pager | grep "Active:"
 else
-    echo "Error: Failed to restart service. Please check configuration."
-    echo "Restoring backup..."
+    echo "错误：服务重启失败。请检查配置。"
+    echo "正在恢复备份..."
     cp "$BACKUP_CONFIG" "$SB_CONFIG"
+    systemctl restart "$SERVICE_NAME"
+    echo "已恢复到修改前的配置。"
 fi
